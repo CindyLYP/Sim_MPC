@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 import threading
 import pathlib
 import pickle
@@ -10,6 +11,13 @@ from Client.Data import DataLoader
 from Client.Learning.Losses import LossFunc, MSELoss
 from Client.Learning.Metrics import onehot_accuracy
 from Utils.Log import Logger
+from Crypto import Random
+from Crypto.Hash import SHA
+from Crypto.Cipher import AES
+from Crypto.Cipher import PKCS1_v1_5 as Cipher_pkcs1_v1_5
+from Crypto.Signature import PKCS1_v1_5 as Signature_pkcs1_v1_5
+from Crypto.PublicKey import RSA
+import base64
 
 
 class DataClient(BaseClient):
@@ -462,3 +470,118 @@ class LabelClient(BaseClient):
             if not train_res:
                 self.logger.logE("Error encountered while training one round. Stop.")
                 break
+
+
+class PreprocessClient(BaseClient):
+    def __init__(self, channel: BaseChannel, filepath, filename, prim_key: int, iv, key,
+                 align_id: int, other_data_clients: list, logger: Logger = None):
+        super(PreprocessClient, self).__init__(channel, logger)
+        self.filepath = filepath
+        self.filename = filename
+        self.data = None
+        self.id = None
+        self.prim_key = prim_key
+        self.iv = iv
+        self.align_id = align_id
+        self.other_clients = other_data_clients
+        self.private_pem = None
+        self.public_pem = None
+        self.public_pem_list = dict()
+        self.aes_key = key
+        self.aes_key_list = list()
+        self.random_generator = Random.new().read
+
+    def __padding(self, s):
+        while len(s) % 16 !=0:
+            s += '\0'
+        return s
+
+    def __generate_rsa_keys(self):
+        rsa = RSA.generate(1024, self.random_generator)
+        self.private_pem = rsa.exportKey()
+        self.public_pem = rsa.publickey().exportKey()
+
+    def __send_public_key(self):
+        for client in self.other_clients:
+            res = self.send_check_msg(client, ComputationMessage(MessageType.RSA_KEY, self.public_pem))
+
+    def __receive_public_keys(self):
+        for client in self.other_clients:
+            msg = self.receive_check_msg(client, MessageType.RSA_KEY)
+            self.public_pem_list[client] = msg.data
+
+    def __send_aes_key(self):
+        for client in self.other_clients:
+            rsa_key = RSA.importKey(self.public_pem_list[client])
+            cipher = Cipher_pkcs1_v1_5.new(rsa_key)
+            cipher_text = base64.b64encode(cipher.encrypt(self.aes_key.encode('utf-8')))
+            res = self.send_check_msg(client, ComputationMessage(MessageType.AES_KEY, cipher_text))
+
+    def __receive_aes_key(self):
+        for client in self.other_clients:
+            msg = self.receive_check_msg(client,MessageType.AES_KEY)
+            rsa_key = RSA.importKey(self.private_pem)
+            cipher = Cipher_pkcs1_v1_5.new(rsa_key)
+            aes_key = cipher.decrypt(base64.b64decode(msg.data), self.random_generator)
+            self.aes_key_list.append(aes_key.decode('utf-8'))
+
+    def __generate_aes_key(self):
+        self.__generate_rsa_keys()
+        self.__send_public_key()
+        self.__receive_public_keys()
+        self.__send_aes_key()
+        self.__receive_aes_key()
+        for key in self.aes_key_list:
+            if len(self.aes_key) > len(key):
+                self.aes_key = "".join([chr(ord(x) ^ ord(y)) for (x, y) in zip(self.aes_key[:len(key)], key)])
+            else:
+                self.aes_key = "".join([chr(ord(x) ^ ord(y)) for (x, y) in zip(self.aes_key, key[:len(self.aes_key)])])
+
+    def __load_and_crypto_data(self):
+        self.data = pd.read_csv(self.filepath+'/'+self.filename, header=None)
+        self.data[self.prim_key] = self.data[self.prim_key].astype(str)
+        self.id = self.data[self.prim_key].values.tolist()
+        enc_id = list()
+        for id in self.id:
+            cipher = AES.new(self.aes_key, AES.MODE_CBC,self.iv)
+            enc_id.append(cipher.encrypt(self.__padding(id)))
+        self.id = enc_id
+
+    def start_align(self):
+        self.__generate_aes_key()
+        self.__load_and_crypto_data()
+        res = self.send_check_msg(self.align_id, ComputationMessage(MessageType.ALIGN_SEND, self.id))
+        msg = self.receive_check_msg(self.align_id, MessageType.ALIGN_REC)
+        aligned_id = msg.data
+        dec_id = list()
+        for id in aligned_id:
+            cipher = AES.new(self.aes_key, AES.MODE_CBC,self.iv)
+            dec_id.append(cipher.decrypt(id).decode('utf-8').replace('\0',''))
+        aligned_id = dec_id
+        aligned_data = self.data[self.data[self.prim_key].isin(aligned_id)]
+        aligned_data.to_csv(self.filepath+'/aligned_'+self.filename, header=None, index=None)
+
+
+class AlignClient(BaseClient):
+    def __init__(self, channel: BaseChannel, data_clients: list, logger: Logger=None):
+        super(AlignClient, self).__init__(channel, logger)
+        self.data_clients = data_clients
+        self.id_lists = list()
+        self.aligned_id = None
+
+    def __receive_crypto_ids(self):
+        for client in self.data_clients:
+            msg = self.receive_check_msg(client, MessageType.ALIGN_SEND)
+            self.id_lists.append(msg.data)
+
+    def __send_aligned_id(self):
+        for client in self.data_clients:
+            res = self.send_check_msg(client, ComputationMessage(MessageType.ALIGN_REC, self.aligned_id))
+
+    def start_align(self):
+        self.__receive_crypto_ids()
+        ald_id = set(self.id_lists[0])
+        for id in self.id_lists[1:]:
+            ald_id = ald_id & set(id)
+        self.aligned_id = list(ald_id)
+        self.__send_aligned_id()

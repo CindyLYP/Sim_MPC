@@ -73,6 +73,12 @@ class MessageType(Enum):
     RECEIVED_ERR = 98
     RECEIVED_OK = 99
 
+    # preprocess flag
+    RSA_KEY = 101
+    AES_KEY = 102
+    ALIGN_SEND = 103
+    ALIGN_REC = 104
+    
 
 class ReceiveERRType(Enum):
     BUFFER_OCCUPIED = 1
